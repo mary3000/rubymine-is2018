@@ -5,17 +5,12 @@ import static com.jetbrains.python.PyTokenTypes.*;
 import com.intellij.codeInspection.LocalInspectionToolSession;
 import com.intellij.codeInspection.ProblemsHolder;
 import com.intellij.psi.PsiElementVisitor;
-import com.intellij.psi.PsiPolyVariantReference;
-import com.intellij.psi.PsiReference;
 import com.intellij.psi.tree.TokenSet;
+import com.jetbrains.python.inspection.PredicateResult.Result;
 import com.jetbrains.python.inspections.PyInspection;
 import com.jetbrains.python.inspections.PyInspectionVisitor;
 import com.jetbrains.python.psi.*;
-import com.jetbrains.python.psi.resolve.PyResolveContext;
-import com.jetbrains.python.psi.resolve.QualifiedRatedResolveResult;
-import com.jetbrains.python.psi.resolve.QualifiedResolveResult;
 import java.math.BigInteger;
-import java.util.List;
 import javafx.util.Pair;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -45,22 +40,16 @@ public class PyConstantExpression extends PyInspection {
             }
         }
 
-        enum PredicateResult {
-            TRUE, FALSE, UNKNOWN;
-
-            private String stringValue() {
-                return this == TRUE ? "true" : "false";
-            }
-        }
-
         private void processIfPart(@NotNull PyIfPart pyIfPart) {
             final PyExpression condition = pyIfPart.getCondition();
-            PredicateResult result = checkBool(condition);
-            if (result != PredicateResult.UNKNOWN) {
-                registerProblem(condition, isAlways + result.stringValue());
+            PredicateResult result = checkBoolExpr(condition);
+            if (result.result != Result.UNKNOWN) {
+                registerProblem(condition, isAlways + result.result.stringValue());
             }
         }
 
+        //Handle expressions like (int operator int), returns int
+        //Boolean key means if it's possible to calculate this
         private Pair<Boolean, BigInteger> getIntOpInt(BigInteger left, BigInteger right, PyElementType operator) {
             BigInteger val = new BigInteger("0");
             if (operator == PLUS) {
@@ -85,7 +74,8 @@ public class PyConstantExpression extends PyInspection {
             return new Pair<>(true, val);
         }
 
-        private PredicateResult getIntPredicateInt(BigInteger left, BigInteger right, PyElementType operator) {
+        //Handle (int predicate int), returns bool result
+        private Result getIntPredicateInt(BigInteger left, BigInteger right, PyElementType operator) {
             int compared = left.compareTo(right);
             boolean result = false;
             if (operator == LT) {
@@ -101,115 +91,134 @@ public class PyConstantExpression extends PyInspection {
             } else if (operator == NE || operator == NE_OLD) {
                 result = compared != 0;
             }
-            return result ? PredicateResult.TRUE : PredicateResult.FALSE;
+            return result ? Result.TRUE : Result.FALSE;
         }
 
+        //Handle (bool predicate bool), returns bool result + extra information
         private PredicateResult getBoolPredicateBool(PredicateResult left, PredicateResult right, PyElementType operator) {
-            boolean leftValue = left == PredicateResult.TRUE;
-            boolean rightValue = right == PredicateResult.TRUE;
-            PredicateResult result = PredicateResult.UNKNOWN;
+            boolean leftValue = left.result == Result.TRUE;
+            boolean rightValue = right.result == Result.TRUE;
+            PredicateResult result = new PredicateResult();
 
             if (operator == AND_KEYWORD) {
-                result = leftValue && rightValue ? PredicateResult.TRUE : PredicateResult.UNKNOWN;
-                if (left == PredicateResult.FALSE || right == PredicateResult.FALSE) {
-                    result = PredicateResult.FALSE;
-                }
+                result = left.and(right);
             } else if (operator == OR_KEYWORD) {
-                result = leftValue || rightValue ? PredicateResult.TRUE : PredicateResult.UNKNOWN;
-                if (left == PredicateResult.FALSE && right == PredicateResult.FALSE) {
-                    result = PredicateResult.FALSE;
-                }
+                result = left.or(right);
             } else if (operator == NE || operator == NE_OLD) {
-                result = leftValue != rightValue ? PredicateResult.TRUE : PredicateResult.FALSE;
-                if (left == PredicateResult.UNKNOWN || right == PredicateResult.UNKNOWN) {
-                    result = PredicateResult.UNKNOWN;
+                result.result = leftValue != rightValue ? Result.TRUE : Result.FALSE;
+                if (left.result == Result.UNKNOWN || right.result == Result.UNKNOWN) {
+                    result.result = Result.UNKNOWN;
+                    if (left.result == right.result && left.area == right.area) {
+                        result.result = Result.FALSE;
+                    }
                 }
             } else if (operator == EQEQ) {
-                result = leftValue == rightValue ? PredicateResult.TRUE : PredicateResult.FALSE;
-                if (left == PredicateResult.UNKNOWN || right == PredicateResult.UNKNOWN) {
-                    result = PredicateResult.UNKNOWN;
+                result.result = leftValue == rightValue ? Result.TRUE : Result.FALSE;
+                if (left.result == Result.UNKNOWN || right.result == Result.UNKNOWN) {
+                    result.result = Result.UNKNOWN;
+                    if (left.result == right.result && left.area == right.area) {
+                        result.result = Result.TRUE;
+                    }
                 }
             }
             return result;
         }
 
-        private PredicateResult checkBool(PyExpression condition) {
+        //Calculate the value of boolean expression
+        private PredicateResult checkBoolExpr(PyExpression condition) {
             if (condition instanceof PyBoolLiteralExpression) {
-                return ((PyBoolLiteralExpression)condition).getValue() ? PredicateResult.TRUE : PredicateResult.FALSE;
+                return ((PyBoolLiteralExpression)condition).getValue() ? new PredicateResult(Result.TRUE) : new PredicateResult(Result.FALSE);
             }
             if (condition instanceof PyBinaryExpression) {
-                return checkBoolBinary((PyBinaryExpression)condition);
+                return checkBoolBinaryExpr((PyBinaryExpression)condition);
             }
             if (condition instanceof PyPrefixExpression) {
-                return checkBoolPrefix((PyPrefixExpression)condition);
+                return checkBoolPrefixExpr((PyPrefixExpression)condition);
             }
             if (condition instanceof PyParenthesizedExpression) {
-                return checkBool(((PyParenthesizedExpression)condition).getContainedExpression());
+                return checkBoolExpr(((PyParenthesizedExpression)condition).getContainedExpression());
             }
-            return PredicateResult.UNKNOWN;
+            return new PredicateResult();
         }
 
-        private PredicateResult checkBoolBinary(PyBinaryExpression binaryExpression) {
+        private PredicateResult checkBoolBinaryExpr(PyBinaryExpression binaryExpression) {
             PyElementType operator = binaryExpression.getOperator();
 
-            PredicateResult boolResult = PredicateResult.UNKNOWN;
+            PredicateResult boolResult = new PredicateResult();
+            //It may consist of boolean expressions
             if (TokenSet.orSet(TokenSet.create(AND_KEYWORD, OR_KEYWORD), EQUALITY_OPERATIONS).contains(operator)) {
 
-                PredicateResult leftResult = checkBool(binaryExpression.getLeftExpression());
-                PredicateResult rightResult = checkBool(binaryExpression.getRightExpression());
+                PredicateResult leftResult = checkBoolExpr(binaryExpression.getLeftExpression());
+                PredicateResult rightResult = checkBoolExpr(binaryExpression.getRightExpression());
 
                 boolResult = getBoolPredicateBool(leftResult, rightResult, operator);
-            }
-
-            PredicateResult numericResult = PredicateResult.UNKNOWN;
-            if (TokenSet.orSet(RELATIONAL_OPERATIONS, EQUALITY_OPERATIONS).contains(operator)) {
-
-                Pair<Boolean, BigInteger> leftFlag = calcInt(binaryExpression.getLeftExpression());
-                Pair<Boolean, BigInteger> rightFlag = calcInt(binaryExpression.getRightExpression());
-
-                if (leftFlag.getKey() && rightFlag.getKey()) {
-                    numericResult = getIntPredicateInt(leftFlag.getValue(), rightFlag.getValue(), operator);
+                if (boolResult.result !=  Result.UNKNOWN) {
+                    return boolResult;
                 }
             }
 
-            return boolResult == PredicateResult.UNKNOWN ? numericResult : boolResult;
+            //Or it may consist of integer expressions
+            if (TokenSet.orSet(RELATIONAL_OPERATIONS, EQUALITY_OPERATIONS).contains(operator)) {
+                PredicateResult numericResult = new PredicateResult();
+
+                Pair<Boolean, BigInteger> leftFlag = calcIntExpr(binaryExpression.getLeftExpression());
+                Pair<Boolean, BigInteger> rightFlag = calcIntExpr(binaryExpression.getRightExpression());
+
+                if (leftFlag.getKey() && rightFlag.getKey()) {
+                    numericResult.result = getIntPredicateInt(leftFlag.getValue(),
+                        rightFlag.getValue(), operator);
+                } else if (binaryExpression.getLeftExpression() instanceof PyReferenceExpression
+                    && rightFlag.getKey()) {
+                    numericResult.value = binaryExpression.getLeftExpression().getName();
+                    numericResult.area = getReferenceArea(operator, rightFlag.getValue(), false);
+                } else if (binaryExpression.getRightExpression() instanceof PyReferenceExpression
+                    && leftFlag.getKey()) {
+                    numericResult.value = binaryExpression.getRightExpression().getName();
+                    numericResult.area = getReferenceArea(operator, leftFlag.getValue(), true);
+                } else {
+                    return boolResult;
+                }
+                return numericResult;
+            }
+            return boolResult;
         }
 
-        private PredicateResult checkBoolPrefix(PyPrefixExpression prefixExpression) {
+        private PredicateResult checkBoolPrefixExpr(PyPrefixExpression prefixExpression) {
             PyExpression condition = prefixExpression.getOperand();
             PyElementType operator = prefixExpression.getOperator();
-            PredicateResult result = PredicateResult.UNKNOWN;
+            PredicateResult result = new PredicateResult();
             if (operator == NOT_KEYWORD) {
-                result = checkBool(condition);
+                result = checkBoolExpr(condition);
             }
-            switch (result) {
+            switch (result.result) {
                 case TRUE:
-                    return PredicateResult.FALSE;
+                    return new PredicateResult(Result.FALSE);
                 case FALSE:
-                    return PredicateResult.TRUE;
+                    return new PredicateResult(Result.TRUE);
                 default:
-                    return PredicateResult.UNKNOWN;
+                    return new PredicateResult();
             }
         }
 
-        private Pair<Boolean, BigInteger> calcInt(PyExpression condition) {
+        //Calculate the value of integer expression
+        private Pair<Boolean, BigInteger> calcIntExpr(PyExpression condition) {
             if (condition instanceof PyNumericLiteralExpression) {
                 BigInteger val = ((PyNumericLiteralExpression)condition).getBigIntegerValue();
                 return new Pair<>(true, val);
             }
             if (condition instanceof PyBinaryExpression) {
-                return calcIntBinary((PyBinaryExpression)condition);
+                return calcIntBinaryExpr((PyBinaryExpression)condition);
             }
             if (condition instanceof PyPrefixExpression) {
-                return calcIntPrefix((PyPrefixExpression)condition);
+                return calcIntPrefixExpr((PyPrefixExpression)condition);
             }
             if (condition instanceof PyParenthesizedExpression) {
-                return calcInt(((PyParenthesizedExpression)condition).getContainedExpression());
+                return calcIntExpr(((PyParenthesizedExpression)condition).getContainedExpression());
             }
             return new Pair<>(false, null);
         }
 
-        private Pair<Boolean, BigInteger> calcIntBinary(PyBinaryExpression binaryExpression) {
+        private Pair<Boolean, BigInteger> calcIntBinaryExpr(PyBinaryExpression binaryExpression) {
             PyElementType operator = binaryExpression.getOperator();
             if (!TokenSet.andNot(TokenSet.orSet(ADDITIVE_OPERATIONS, MULTIPLICATIVE_OPERATIONS, STAR_OPERATORS),
                 TokenSet.create(AT, DIV))
@@ -217,8 +226,8 @@ public class PyConstantExpression extends PyInspection {
                 return new Pair<>(false, null);
             }
 
-            Pair<Boolean, BigInteger> leftPair = calcInt(binaryExpression.getLeftExpression());
-            Pair<Boolean, BigInteger> rightPair = calcInt(binaryExpression.getRightExpression());
+            Pair<Boolean, BigInteger> leftPair = calcIntExpr(binaryExpression.getLeftExpression());
+            Pair<Boolean, BigInteger> rightPair = calcIntExpr(binaryExpression.getRightExpression());
 
             if (!leftPair.getKey() || !rightPair.getKey()) {
                 return new Pair<>(false, null);
@@ -226,7 +235,7 @@ public class PyConstantExpression extends PyInspection {
             return getIntOpInt(leftPair.getValue(), rightPair.getValue(), operator);
         }
 
-        private Pair<Boolean, BigInteger> calcIntPrefix(PyPrefixExpression prefixExpression) {
+        private Pair<Boolean, BigInteger> calcIntPrefixExpr(PyPrefixExpression prefixExpression) {
             PyElementType operator = prefixExpression.getOperator();
             PyExpression condition = prefixExpression.getOperand();
 
@@ -234,7 +243,7 @@ public class PyConstantExpression extends PyInspection {
                 return new Pair<>(false, null);
             }
 
-            Pair<Boolean, BigInteger> flag = calcInt(condition);
+            Pair<Boolean, BigInteger> flag = calcIntExpr(condition);
             if (flag.getKey()) {
                 if (operator == MINUS) {
                     return new Pair<>(true, (flag.getValue()).negate());
@@ -242,6 +251,25 @@ public class PyConstantExpression extends PyInspection {
                 return flag;
             }
             return new Pair<>(false, null);
+        }
+
+        //Calculate the area of possible values for some reference
+        private ValueArea getReferenceArea(PyElementType operator, BigInteger val, boolean reversed) {
+            if (operator == LT && !reversed || operator == GT && reversed) {
+                return new ValueArea(new Segment(null, val, true, false));
+            } else if (operator == GT || operator == LT) {
+                return new ValueArea(new Segment(val, null, false, true));
+            } else if (operator == EQEQ) {
+                return new ValueArea(new Segment(val, val, true, true));
+            } else if (operator == GE && !reversed || operator == LE && reversed) {
+                return new ValueArea(new Segment(val, null, true, true));
+            } else if (operator == LE || operator == GE) {
+                return new ValueArea(new Segment(null, val, true, true));
+            } else if (operator == NE || operator == NE_OLD) {
+                return new ValueArea(new Segment(null, val, true, false)).add(new ValueArea(new Segment(val, null, false, true)));
+            }
+            // unreachable
+            return new ValueArea();
         }
 
     }
